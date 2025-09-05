@@ -103,7 +103,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         camera_pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1))
         rendering = render(
-            view, gaussians, pipeline, background, camera_pose=camera_pose
+            view.float(), gaussians, pipeline, background, camera_pose=camera_pose.float()
         )["render"]
         gt = view.original_image[0:3, :, :]
         image_path = os.path.join(render_path, "{0:05d}".format(idx) + ".png")

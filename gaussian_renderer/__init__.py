@@ -57,6 +57,7 @@ def render(
         w2c.unsqueeze(0).bmm(viewpoint_camera.projection_matrix.unsqueeze(0))
     ).squeeze(0)
     camera_pos = w2c.inverse()[3, :3]
+    projmatrix=projmatrix.float()
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -123,6 +124,7 @@ def render(
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    means3D = means3D.float()
     rendered_image, radii = rasterizer(
         means3D=means3D,
         means2D=means2D,
