@@ -551,6 +551,9 @@ def render_sets(
     output_data.visualize_object_detector = defaultdict(list)
     bg_id = (0, 42, 43, 44, 45, 46, 47)
     is_remove_bg = True
+    render_path = os.path.join(dataset.model_path, "interp", "ours_{}".format(1000), "renders")
+    intermediate_output_path = os.path.join(dataset.model_path, "interp", "ours_{}".format(1000), "intermediate_output")
+    os.makedirs(intermediate_output_path, exist_ok=True)
     for i, cam_view in enumerate(valid_camera_views):
         occupancy_check = False
         if renderings[i] is None:
@@ -572,6 +575,18 @@ def render_sets(
             is_remove_bg=is_remove_bg,
         )
 
+        bboxes = output_data.objectbox[vco_cam_view]
+        image_path = os.path.join(render_path, "{0:05d}".format(cam_view) + ".png")
+        image = np.array(cv2.imread(image_path))
+        # Draw bounding boxes on the image
+        for bbox in bboxes:
+            x1, y1, x2, y2 = map(int, bbox)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # Save the image with bounding boxes
+        output_image_path = os.path.join(intermediate_output_path, "{0:05d}_bbox.png".format(cam_view))
+        cv2.imwrite(output_image_path, image)
+        print(f"Saved image with bounding boxes: {output_image_path}")
+
     # Run semantic segmentation
     segmentationmap = SegmentationMap(
         window=None,
@@ -590,6 +605,18 @@ def render_sets(
             yolo_masks=yolo_masks[vco_cam_view],
             use_detection_segmentation=config.use_detection_segmentation,
         )
+
+        image_path = os.path.join(render_path, "{0:05d}".format(cam_view) + ".png")
+        image = np.array(cv2.imread(image_path))
+        segmentmap = output_data.multisegmentlist[vco_cam_view][0][0]
+        # Draw segmentation map on the image
+        colored_mask = (segmentmap * 255).astype(np.uint8)
+        colored_mask = cv2.applyColorMap(colored_mask, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(image, 0.7, colored_mask, 0.3, 0)
+        # Save the image with segmentation map
+        output_image_path = os.path.join(intermediate_output_path, "{0:05d}_segmentation.png".format(cam_view))
+        cv2.imwrite(output_image_path, overlay)
+        print(f"Saved image with segmentation map: {output_image_path}")
 
     poses = []
     segments = []
