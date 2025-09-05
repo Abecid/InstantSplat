@@ -38,7 +38,7 @@ def render(
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = (
         torch.zeros_like(
-            pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"
+            pc.get_xyz.float(), dtype=pc.get_xyz.float().dtype, requires_grad=True, device="cuda"
         )
         + 0
     )
@@ -80,8 +80,8 @@ def render(
     # means3D = pc.get_xyz
     rel_w2c = get_camera_from_tensor(camera_pose)
     # Transform mean and rot of Gaussians to camera frame
-    gaussians_xyz = pc._xyz.clone()
-    gaussians_rot = pc._rotation.clone()
+    gaussians_xyz = pc._xyz.clone().float()
+    gaussians_rot = pc._rotation.clone().float()
 
     xyz_ones = torch.ones(gaussians_xyz.shape[0], 1).cuda().float()
     xyz_homo = torch.cat((gaussians_xyz, xyz_ones), dim=1)
@@ -89,7 +89,7 @@ def render(
     gaussians_rot_trans = quadmultiply(camera_pose[:4], gaussians_rot)
     means3D = gaussians_xyz_trans
     means2D = screenspace_points
-    opacity = pc.get_opacity
+    opacity = pc.get_opacity.float()
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -97,9 +97,9 @@ def render(
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        cov3D_precomp = pc.get_covariance(scaling_modifier).float()
     else:
-        scales = pc.get_scaling
+        scales = pc.get_scaling.float()
         rotations = gaussians_rot_trans  # pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
@@ -108,17 +108,17 @@ def render(
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(
-                -1, 3, (pc.max_sh_degree + 1) ** 2
+            shs_view = pc.get_features.float().transpose(1, 2).view(
+                -1, 3, (pc.max_sh_degree.float() + 1) ** 2
             )
-            dir_pp = pc.get_xyz - viewpoint_camera.camera_center.repeat(
-                pc.get_features.shape[0], 1
+            dir_pp = pc.get_xyz.float() - viewpoint_camera.camera_center.repeat(
+                pc.get_features.shape[0].float(), 1
             )
             dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
-            shs = pc.get_features
+            shs = pc.get_features.float()
     else:
         colors_precomp = override_color
 

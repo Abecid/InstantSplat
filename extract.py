@@ -217,48 +217,63 @@ def project_gaussians_to_pixels(pc, view, camera_pose):
     Returns:
       uv: (N, 2) pixel coords
       z_cam: (N,) depth in camera frame
-      vis: (N,) bool, inside frustum (image bounds + NDC) with inferred front sign
+      vis: (N,) bool, inside image with inferred front sign
       px_radius: (N,) approximate screen radius
     """
     device = pc._xyz.device
-    rel_w2c = get_camera_from_tensor(camera_pose).to(device)         # (4,4)
-    P = view.projection_matrix.to(device)                            # (4,4)
+    dtype  = pc._xyz.dtype
     H, W = int(view.image_height), int(view.image_width)
 
-    # 3D → camera
+    # --- world -> camera (homogeneous) ---
+    rel_w2c = get_camera_from_tensor(camera_pose).to(device=device, dtype=dtype)   # (4,4)
     N = pc._xyz.shape[0]
-    ones = torch.ones(N, 1, device=device, dtype=pc._xyz.dtype)
-    xyz_h = torch.cat([pc._xyz, ones], dim=1)                        # (N,4)
-    cam = (rel_w2c @ xyz_h.T).T                                      # (N,4)
-    z_cam = cam[:, 2]
+    ones = torch.ones(N, 1, device=device, dtype=dtype)
+    xyz_h = torch.cat([pc._xyz, ones], dim=1)                                      # (N,4)
+    cam = (rel_w2c @ xyz_h.T).T                                                    # (N,4)
 
-    # camera → clip → NDC → pixels
-    clip = (P @ cam.T).T                                             # (N,4)
-    w = clip[:, 3].clamp(min=1e-8)
-    ndc = clip[:, :3] / w.unsqueeze(1)                               # [-1,1]
-    u = (ndc[:, 0] * 0.5 + 0.5) * W
-    v = (-(ndc[:, 1]) * 0.5 + 0.5) * H                               # Y flip to match your render()
+    x = cam[:, 0]
+    y = cam[:, 1]
+    z = cam[:, 2]
+    z_safe = torch.where(z == 0, torch.full_like(z, 1e-8), z)
+
+    # --- intrinsics from FoV (handle deg/rad) ---
+    FoVx = torch.as_tensor(getattr(view, "FoVx"), device=device, dtype=dtype)
+    FoVy = torch.as_tensor(getattr(view, "FoVy"), device=device, dtype=dtype)
+    # If someone passed degrees, convert
+    if float(FoVx) > 3.2 or float(FoVy) > 3.2:
+        FoVx = torch.deg2rad(FoVx)
+        FoVy = torch.deg2rad(FoVy)
+
+    fx = 0.5 * W / torch.tan(FoVx / 2)
+    fy = 0.5 * H / torch.tan(FoVy / 2)
+    cx = 0.5 * W
+    cy = 0.5 * H
+
+    # --- camera -> pixel ---
+    # image y points down, so subtract fy*(y/z)
+    u = fx * (x / z_safe) + cx
+    v = cy - fy * (y / z_safe)
     uv = torch.stack([u, v], dim=1)
 
-    # bounds checks
-    in_ndc = (ndc[:,0].abs()<=1) & (ndc[:,1].abs()<=1) & (ndc[:,2].abs()<=1)
-    in_img = (u>=0) & (u<W) & (v>=0) & (v<H)
-
-    # infer front-facing sign (OpenGL-style cameras use z<0; others z>0)
-    vis_neg = (z_cam < 0) & in_ndc & in_img
-    vis_pos = (z_cam > 0) & in_ndc & in_img
-    # pick the one that yields more visible points
+    # --- visibility (NO NDC; just pixel bounds + z sign) ---
+    in_img = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    vis_neg = (z < 0) & in_img    # OpenGL-style: camera looks down -Z
+    vis_pos = (z > 0) & in_img    # Some pipelines use +Z forward
     vis = vis_neg if vis_neg.sum() >= vis_pos.sum() else vis_pos
 
-    # pixel radius ~ f * s / |z|
-    fx = 0.5*W/torch.tan(torch.tensor(view.FoVx, device=device)/2)
-    fy = 0.5*H/torch.tan(torch.tensor(view.FoVy, device=device)/2)
-    s = pc.get_scaling.max(dim=1).values
-    f = (fx+fy)*0.5
-    z_abs = z_cam.abs().clamp(min=1e-6)
-    px_radius = (f * s / z_abs).clamp(max=64.0)
+    # --- approximate pixel radius: f * s / |z| ---
+    s = pc.get_scaling.max(dim=1).values  # assume (N,3) -> (N,)
+    f_mean = (fx + fy) * 0.5
+    px_radius = (f_mean * s / z.abs().clamp(min=1e-6)).clamp(max=64.0)
 
-    return uv, z_cam, vis, px_radius
+    print("proj:", {
+        "in_img": int(in_img.sum().item()),
+        "z<0": int((z<0).sum().item()),
+        "z>0": int((z>0).sum().item()),
+        "vis": int(vis.sum().item())}
+    )
+
+    return uv, z, vis, px_radius
 
 
 
@@ -279,6 +294,12 @@ def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
     grid = torch.stack([grid_u, grid_v], dim=1).view(1,1,N,2)  # N points
     m = F.grid_sample(mask_tensor.view(1,1,H,W).float(), grid, align_corners=True, mode="bilinear") # (1,1,1,N)
     center_inside = (m.view(N) > thresh)
+
+    print("mask:", {
+        "center_inside": int(center_inside.sum().item()),
+        "vis": int(vis.sum().item()),
+        "keep": int((vis & center_inside).sum().item())
+    })
 
     # inflate by morphological max via a cheap trick: resample a downscaled mask
     # (for speed) OR just accept center test + visibility for a first pass.
