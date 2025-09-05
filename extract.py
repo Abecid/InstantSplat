@@ -14,6 +14,11 @@ import json
 from os import makedirs
 from time import time, perf_counter
 from argparse import ArgumentParser
+import sys
+from collections import defaultdict
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(ROOT, "models"))
 
 import torch
 import torchvision
@@ -22,17 +27,25 @@ import imageio
 import numpy as np
 from pathlib import Path
 import torch.nn.functional as F
+import cv2
 
 from scene import Scene
 from scene.dataset_readers import loadCameras
 from gaussian_renderer import render, GaussianModel
 from utils.general_utils import safe_state
-from utils.pose_utils import get_tensor_from_camera
+from utils.pose_utils import get_tensor_from_camera, get_camera_from_tensor
 from utils.loss_utils import l1_loss, ssim, l1_loss_mask, ssim_loss_mask
 from utils.sfm_utils import save_time
 from utils.camera_utils import generate_interpolated_path
 from utils.camera_utils import visualizer
 from arguments import ModelParams, PipelineParams, get_combined_args
+
+# VCO
+from config import make_vco_args, init_cam_configs
+from modules.segmentation import SegmentationMap
+from modules.objectDetect import ObjectDetector
+from interface.common import CameraView
+from modules.outputData import OutputData
 
 def save_interpolate_pose(model_path, iter, n_views):
 
@@ -76,12 +89,16 @@ def images_to_video(image_folder, output_video_path, fps=30):
 
     imageio.mimwrite(output_video_path, images, fps=fps)
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, num_sample_renderings=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+
+    if num_sample_renderings:
+        sample_renderings = []
+        indices = np.linspace(0, len(views)-1, num_sample_renderings, dtype=int)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         camera_pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1))
@@ -89,13 +106,21 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             view, gaussians, pipeline, background, camera_pose=camera_pose
         )["render"]
         gt = view.original_image[0:3, :, :]
+        image_path = os.path.join(render_path, "{0:05d}".format(idx) + ".png")
         torchvision.utils.save_image(
-            rendering, os.path.join(render_path, "{0:05d}".format(idx) + ".png")
+            rendering, image_path
         )
         if name != "interp":
             torchvision.utils.save_image(   
                 gt, os.path.join(gts_path, "{0:05d}".format(idx) + ".png")
             )
+        if num_sample_renderings and idx in indices:
+            image = np.array(cv2.imread(image_path))
+            sample_renderings.append(image)
+            # sample_renderings.append(rendering.detach().cpu().numpy())
+
+    if num_sample_renderings:
+        return sample_renderings
 
 def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -191,9 +216,9 @@ def project_gaussians_to_pixels(pc, view, camera_pose):
     """
     Returns:
       uv: (N, 2) pixel coords
-      z_cam: (N,) depth in camera frame (positive = in front)
-      vis: (N,) bool, inside frustum (after homogeneous divide and image bounds)
-      px_radius: (N,) approximate screen radius (for margin)
+      z_cam: (N,) depth in camera frame
+      vis: (N,) bool, inside frustum (image bounds + NDC) with inferred front sign
+      px_radius: (N,) approximate screen radius
     """
     device = pc._xyz.device
     rel_w2c = get_camera_from_tensor(camera_pose).to(device)         # (4,4)
@@ -205,40 +230,45 @@ def project_gaussians_to_pixels(pc, view, camera_pose):
     ones = torch.ones(N, 1, device=device, dtype=pc._xyz.dtype)
     xyz_h = torch.cat([pc._xyz, ones], dim=1)                        # (N,4)
     cam = (rel_w2c @ xyz_h.T).T                                      # (N,4)
-    z_cam = cam[:, 2]                                                # depth (right-handed: verify sign)
+    z_cam = cam[:, 2]
 
     # camera → clip → NDC → pixels
     clip = (P @ cam.T).T                                             # (N,4)
     w = clip[:, 3].clamp(min=1e-8)
-    ndc = clip[:, :3] / w.unsqueeze(1)                               # (x,y,z) in [-1,1]
+    ndc = clip[:, :3] / w.unsqueeze(1)                               # [-1,1]
     u = (ndc[:, 0] * 0.5 + 0.5) * W
-    v = (-(ndc[:, 1]) * 0.5 + 0.5) * H                               # flip Y as needed
+    v = (-(ndc[:, 1]) * 0.5 + 0.5) * H                               # Y flip to match your render()
     uv = torch.stack([u, v], dim=1)
 
-    # frustum & image bounds
-    in_front = z_cam < 0 if view.convention_is_opengl else z_cam > 0 # pick the sign your renderer assumes; in your code you used identity view, so check one frame
+    # bounds checks
     in_ndc = (ndc[:,0].abs()<=1) & (ndc[:,1].abs()<=1) & (ndc[:,2].abs()<=1)
     in_img = (u>=0) & (u<W) & (v>=0) & (v<H)
-    vis = in_front & in_ndc & in_img
 
-    # crude screen-space radius from scale (world) and depth
-    # 3DGS scale is per-axis ellipsoid; take max axis and approximate pixel radius ~ f * s / z
-    # Derive focal from FoV + width/height:
+    # infer front-facing sign (OpenGL-style cameras use z<0; others z>0)
+    vis_neg = (z_cam < 0) & in_ndc & in_img
+    vis_pos = (z_cam > 0) & in_ndc & in_img
+    # pick the one that yields more visible points
+    vis = vis_neg if vis_neg.sum() >= vis_pos.sum() else vis_pos
+
+    # pixel radius ~ f * s / |z|
     fx = 0.5*W/torch.tan(torch.tensor(view.FoVx, device=device)/2)
     fy = 0.5*H/torch.tan(torch.tensor(view.FoVy, device=device)/2)
-    s = pc.get_scaling.max(dim=1).values                             # (N,)
-    # avoid div-by-zero; use |z| and whichever focal:
+    s = pc.get_scaling.max(dim=1).values
     f = (fx+fy)*0.5
     z_abs = z_cam.abs().clamp(min=1e-6)
-    px_radius = (f * s / z_abs).clamp(max=64.0)                      # cap to avoid huge radii
+    px_radius = (f * s / z_abs).clamp(max=64.0)
+
     return uv, z_cam, vis, px_radius
 
 
-def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, margin_factor=0.75):
+
+def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
     """
     mask_tensor: (H,W) float/bool on same device
     Returns keep: (N,) bool
     """
+    mask_tensor = torch.as_tensor(mask_tensor, dtype=torch.float32, device=uv.device)
+
     device = mask_tensor.device
     H, W = mask_tensor.shape
     N = uv.shape[0]
@@ -247,8 +277,8 @@ def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, margin_factor=0.75):
     grid_u = (uv[:,0] / max(W-1,1))*2 - 1
     grid_v = (uv[:,1] / max(H-1,1))*2 - 1
     grid = torch.stack([grid_u, grid_v], dim=1).view(1,1,N,2)  # N points
-    m = F.grid_sample(mask_tensor.view(1,1,H,W).float(), grid, align_corners=True, mode="bilinear")
-    center_inside = (m.view(N) > 0.5)
+    m = F.grid_sample(mask_tensor.view(1,1,H,W).float(), grid, align_corners=True, mode="bilinear") # (1,1,1,N)
+    center_inside = (m.view(N) > thresh)
 
     # inflate by morphological max via a cheap trick: resample a downscaled mask
     # (for speed) OR just accept center test + visibility for a first pass.
@@ -269,10 +299,10 @@ def select_object_gaussians(pc, views, masks, camera_poses, vote_thresh=None):
 
     for view, mask, cam_pose in zip(views, masks, camera_poses):
         uv, z, vis, r = project_gaussians_to_pixels(pc, view, cam_pose)
-        keep = gaussians_inside_mask(uv, vis, r, mask)
+        keep = gaussians_inside_mask(uv, vis, r, mask[0])
         votes += keep.int()
 
-    if vote_thresh is None:
+    if vote_thresh is None or vote_thresh < 0:
         vote_thresh = (K+1)//2
     keep_idx = (votes >= vote_thresh).nonzero(as_tuple=True)[0]
     return keep_idx
@@ -286,7 +316,7 @@ def bbox_from_points(xyz):
     # OBB via PCA
     X = xyz - xyz.mean(dim=0, keepdim=True)
     C = X.T @ X / max(1, X.shape[0]-1)
-    evals, evecs = torch.linalg.eigh(C)      # columns = eigenvectors
+    evals, evecs = torch.linalg.eigh(C.float())      # columns = eigenvectors
     # project onto OBB axes:
     proj = X @ evecs                          # (N,3)
     obb_min = proj.min(dim=0).values
@@ -399,14 +429,14 @@ def _load_masks_and_views(scene, args, iteration, device):
     raise ValueError("Provide either --seg_paths or (--seg_dir and --seg_views).")
 
 
-def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args):
+def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, masks, camera_poses, views):
     device = gaussians._xyz.device
-    views, masks, camera_poses = _load_masks_and_views(scene, args, iteration, device)
+    # views, masks, camera_poses = _load_masks_and_views(scene, args, iteration, device)
 
     # 1) select by multi-view voting
     keep_idx = select_object_gaussians(
         gaussians, views, masks, camera_poses,
-        vote_thresh=args.vote_thresh, mask_thresh=0.5
+        vote_thresh=args.vote_thresh
     )
 
     if keep_idx.numel() == 0:
@@ -427,17 +457,7 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     out_dir = Path(dataset.model_path) / f"objects/ours_{iteration}/{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 4) save selection metadata
-    torch.save({
-        "keep_idx_voted": keep_idx.detach().cpu(),
-        "keep_idx_box": keep_final.detach().cpu(),
-        "aabb_min": aabb_min.detach().cpu(), "aabb_max": aabb_max.detach().cpu(),
-        "obb_center": center.detach().cpu(), "obb_R": R.detach().cpu(), "obb_extents": extents.detach().cpu(),
-        "use_obb": bool(args.use_obb), "bbox_margin": float(args.bbox_margin),
-        "views_used": [v.image_name for v in views],
-    }, out_dir / "object_selection.pt")
-
-    # 5) save cropped splats to PLY and (optional) render them
+    # 4) save cropped splats to PLY and (optional) render them
     ply_path, obj_pc = save_object_subcloud(gaussians, keep_final, out_dir, sh_degree=dataset.sh_degree)
     print(f"✅ Saved object splats: {ply_path}")
 
@@ -454,6 +474,8 @@ def render_sets(
     skip_train: bool,
     skip_test: bool,
     args,
+    vco_args,
+    roi_mask_coords
 ):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
@@ -495,7 +517,7 @@ def render_sets(
         save_interpolate_pose(Path(args.model_path), iteration, args.n_views)
         interp_pose = np.load(Path(args.model_path) / 'pose' / f'ours_{iteration}' / 'pose_interpolated.npy')
         viewpoint_stack = loadCameras(interp_pose, scene.getTrainCameras())
-        render_set(
+        renderings = render_set(
             dataset.model_path,
             "interp",
             scene.loaded_iter,
@@ -503,22 +525,154 @@ def render_sets(
             gaussians,
             pipeline,
             background,
+            num_sample_renderings=args.num_render_views
         )
         image_folder = os.path.join(dataset.model_path, f'interp/ours_{iteration}/renders')
         output_video_file = os.path.join(dataset.model_path, f'interp/ours_{iteration}/interp_{args.n_views}_view.mp4')
         images_to_video(image_folder, output_video_file, fps=30)
 
     # Task: Extract 3D Gaussian model
-    # Use 3 rendered images saved above
+    # Use 3 rendered images saved above (renderings)
+    config = vco_args
     # Run object detection
+    object_detector = ObjectDetector(
+        config, cam_coords=roi_mask_coords
+    )
+    valid_camera_views = np.linspace(0, len(viewpoint_stack)-1, args.num_render_views, dtype=int)
+    valid_vco_camera_views = [
+        'LW',
+        'TC',
+        'RW',
+    ]
+    output_data = OutputData(config)
+    yolo_masks = dict()
+    output_data.cls = defaultdict(list)
+    output_data.conf = defaultdict(list)
+    output_data.visualize_object_detector = defaultdict(list)
+    bg_id = (0, 42, 43, 44, 45, 46, 47)
+    is_remove_bg = True
+    for i, cam_view in enumerate(valid_camera_views):
+        occupancy_check = False
+        if renderings[i] is None:
+            print(f"no image comes : {cam_view}")
+
+        vco_cam_view = valid_vco_camera_views[i]
+        (
+            output_data.objectbox[vco_cam_view],
+            output_data.numobject[vco_cam_view],
+            output_data.occupancy,
+            yolo_masks[vco_cam_view],
+        ) = object_detector(
+            renderings[i],
+            # output_data,
+            vco_cam_view,
+            mode="capture",
+            occupancy_check=occupancy_check,
+            bg_id=bg_id,
+            is_remove_bg=is_remove_bg,
+        )
+
     # Run semantic segmentation
+    segmentationmap = SegmentationMap(
+        window=None,
+        config=config,
+        main_cam_view=config.main_cam,
+        cam_coords=roi_mask_coords,
+    )
+    for i, cam_view in enumerate(valid_camera_views):
+        vco_cam_view = valid_vco_camera_views[i]
+        output_data = segmentationmap(
+            renderings[i],
+            output_data,
+            vco_cam_view,
+            mode="capture",
+            occupancy_check=False,
+            yolo_masks=yolo_masks[vco_cam_view],
+            use_detection_segmentation=config.use_detection_segmentation,
+        )
+
+    poses = []
+    segments = []
+    views = []
+    views_all = viewpoint_stack
+    device = gaussians._xyz.device
+    for i, cam_view in enumerate(valid_camera_views):
+        vco_cam_view = valid_vco_camera_views[i]
+        v = views_all[cam_view]
+        cam_pose = get_tensor_from_camera(v.world_view_transform.transpose(0,1)).to(device)
+        poses.append(cam_pose)
+        segments.append(output_data.multisegmentlist[vco_cam_view][0])
+        views.append(v)
+
     # Get 3D Bounding Boxes
     # Get object gasusian splatting
     
     # Save GSplat
     # Save rendering
-    get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args)
+    get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, segments, poses, views)
 
+
+dataset_type="welstory_1st"
+
+mannamil_dataset_path = "dataset/0000_mannamil_20250707_061547/raw"
+vco_2nd_dataset_path = "dataset/vco_2nd_eval/data/vco_7/log/capture"
+welstory_dataset_path = "dataset/vco_welstory_pre_eval/data/vco_vol_3/log/capture"
+welstory_poc_dataset_path = "dataset/vco_eval_welstory_1st_poc/data/vco_vol_4/log/capture"
+
+if dataset_type == "mannamil":
+    data_id = "937_135"
+    dataset_path = f"{mannamil_dataset_path}/{data_id}"
+elif dataset_type == "vco_2nd":
+    data_id = "0"
+    dataset_path = f"{vco_2nd_dataset_path}/{data_id}"
+elif dataset_type == "welstory_1st":
+    data_id = "9"
+    dataset_path = f"{welstory_poc_dataset_path}/{data_id}"
+
+def vco_setup():
+    vco_args = make_vco_args(overrides={
+        "main_cam": "TB",
+        "use_detection_segmentation": "true",
+        "prompt_type": "box",
+        "sam2_type": "imagepred",
+        "image_height": 480,
+        "image_width": 640,
+        "object_detector": "yolo",
+        "store_cd": "welstory_1st",
+        "num_top_k": 2,
+        "depth_threshold": 30.0,
+    })
+    if dataset_type == "mannamil":
+        vco_args.stereo_path = f"{dataset_path}/mask/stereo_config_online.json"
+        mask_path = f"{dataset_path}/mask"
+        vco_args.object_detector = "dfine"
+        vco_args.project = "manna"
+    elif dataset_type == "vco_2nd":
+        mask_path = dataset_path[:dataset_path.find("/log")] + "/mask"
+        vco_args.stereo_path = dataset_path[:dataset_path.find("/data/vco")] + "/stereo_config_online.json"
+        vco_args.object_detector = "yolo"
+        vco_args.project = "phase3"
+    elif dataset_type == "welstory_1st":
+        vco_args.stereo_path = dataset_path[:dataset_path.find("/log")] + "/mask/stereo_config_online.json"
+        mask_path = dataset_path[:dataset_path.find("/log")] + "/mask"
+        vco_args.object_detector = "yolo"
+        vco_args.store_cd = "welstory_1st"
+
+    valid_camera_views: list[CameraView] = [
+        CameraView.TOP_BACK,
+        CameraView.TOP_FRONT,
+        CameraView.TOP_LEFT,
+        CameraView.TOP_RIGHT,
+        CameraView.TOP_CENTER,
+        CameraView.LEFT_WING,
+        CameraView.RIGHT_WING,
+    ]
+
+    roi_mask_coords = init_cam_configs(
+        valid_camera_views, cam_coords_root=mask_path
+    )
+
+    return vco_args, roi_mask_coords
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -532,10 +686,20 @@ if __name__ == "__main__":
     parser.add_argument("--optim_test_pose_iter", default=500, type=int)
     parser.add_argument("--infer_video", action="store_true")
     parser.add_argument("--test_fps", action="store_true")
+    
+    # NEW: object extraction args
+    parser.add_argument("--num_render_views", type=int, default=3, help="Number of rendering views --num_render_views (e.g., 1,4,9).")
+    parser.add_argument("--vote_thresh", type=int, default=1, help="1 by default.")
+    parser.add_argument("--out_tag", type=str, default="obj", help="Subfolder tag under objects/ours_<iter>/")
+    parser.add_argument("--render_object", default=True, type=bool, help="Render the cropped splats with selected views.")
+    parser.add_argument("--use_obb", action="store_true", help="Use OBB crop instead of AABB.")
+    parser.add_argument("--bbox_margin", type=float, default=0.0, help="Expand bbox by this world distance.")
+
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
-    # Initialize system state (RNG)
-    # safe_state(args.quiet)
+    vco_args, roi_mask_coords = vco_setup()
 
-    render_sets(model.extract(args), args.iterations, pipeline.extract(args), args.skip_train, args.skip_test, args)
+    
+
+    render_sets(model.extract(args), args.iterations, pipeline.extract(args), args.skip_train, args.skip_test, args, vco_args, roi_mask_coords)

@@ -19,3 +19,8 @@ icecream
 
 plyfile
 open3d
+
+# vc
+onnxruntime-gpu
+hydra-core
+boto3
