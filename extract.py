@@ -28,6 +28,7 @@ import numpy as np
 from pathlib import Path
 import torch.nn.functional as F
 import cv2
+from scipy.spatial import ConvexHull
 
 from scene import Scene
 from scene.dataset_readers import loadCameras
@@ -277,7 +278,7 @@ def project_gaussians_to_pixels(pc, view, camera_pose):
 
 
 
-def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
+def gaussians_inside_mask_dep(uv, vis, px_radius, mask_tensor, thresh=0.5):
     """
     mask_tensor: (H,W) float/bool on same device
     Returns keep: (N,) bool
@@ -305,6 +306,54 @@ def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
     # (for speed) OR just accept center test + visibility for a first pass.
     keep = vis & center_inside
     return keep
+
+
+def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
+    """
+    mask_tensor: (H,W) float/bool/uint8; returns keep: (N,) bool
+    Uses a tiny disk around each uv with radius ~ px_radius to be robust.
+    """
+    # normalize mask
+    m = torch.as_tensor(mask_tensor, dtype=torch.float32, device=uv.device)
+    if m.ndim == 3:  # HWC or CHW -> squeeze
+        m = m[..., 0] if m.shape[-1] in (3,4) else m.squeeze(0)
+    H, W = m.shape
+
+    N = uv.shape[0]
+    # clamp to reasonable minimum/maximum screen footprint
+    r = px_radius.clamp(min=0.75, max=8.0)
+
+    # build 8-point ring samples per gaussian (cheap “dilation”)
+    angles = torch.linspace(0, 2*np.pi, steps=8, device=uv.device, dtype=uv.dtype)[:-1]
+    du = (r[:, None] * torch.cos(angles)[None, :])
+    dv = (r[:, None] * torch.sin(angles)[None, :])
+
+    U = uv[:, 0:1] + du
+    V = uv[:, 1:2] + dv
+
+    # also include center sample
+    U = torch.cat([uv[:, 0:1], U], dim=1)  # (N,9)
+    V = torch.cat([uv[:, 1:2], V], dim=1)  # (N,9)
+
+    # grid_sample expects [-1,1]
+    grid_u = (U / max(W-1, 1)) * 2 - 1
+    grid_v = (V / max(H-1, 1)) * 2 - 1
+    grid = torch.stack([grid_u, grid_v], dim=-1).view(1, 1, -1, 2)
+
+    sampled = F.grid_sample(m.view(1,1,H,W), grid, mode="bilinear", align_corners=True)
+    sampled = sampled.view(N, -1)  # (N,9)
+
+    frac_inside = (sampled > thresh).float().mean(dim=1)
+    keep = vis & (frac_inside > 0.25)  # need at least ~2/8 neighbors or center
+
+    # debug counts
+    print("mask:", {
+        "any_inside": int((frac_inside > 0).sum().item()),
+        "vis": int(vis.sum().item()),
+        "keep": int(keep.sum().item())
+    })
+    return keep
+
 
 
 def select_object_gaussians(pc, views, masks, camera_poses, vote_thresh=None):
@@ -393,66 +442,36 @@ def save_object_subcloud(pc, keep_idx, out_dir, sh_degree=None):
     return ply_path, obj_pc
 
 
-def _read_mask(path, H, W, device):
-    arr = imageio.imread(path)
-    if arr.ndim == 3:
-        arr = arr[...,0]  # take one channel if RGB
-    t = torch.from_numpy((arr > 0).astype(np.float32)).to(device)
-    # resize if needed (nearest)
-    if t.shape[0] != H or t.shape[1] != W:
-        t = t.view(1,1,*t.shape)
-        t = F.interpolate(t, size=(H,W), mode="nearest").view(H,W)
-    return t
-
-
-def _resolve_view_list(scene, which="test"):
-    return scene.getTestCameras() if which == "test" else scene.getTrainCameras()
-
-
-def _load_masks_and_views(scene, args, iteration, device):
+def get_hull(xyz_obj: torch.Tensor):
     """
-    Returns: views[list], masks[list of HxW CUDA tensors], camera_poses[list of (q,T)]
+    Build a 3D convex hull from selected object points.
+    xyz_obj: (M,3) torch tensor
+    Returns: scipy ConvexHull
     """
-    views_all = _resolve_view_list(scene, "test")
-    masks, views, poses = [], [], []
+    pts = xyz_obj.detach().cpu().numpy()
+    hull = ConvexHull(pts)
+    return hull
 
-    if args.seg_paths:
-        paths = [p.strip() for p in args.seg_paths.split(",") if p.strip()]
-        assert len(paths) > 0, "seg_paths empty"
-        for i, p in enumerate(paths):
-            v = views_all[i]
-            H, W = int(v.image_height), int(v.image_width)
-            m = _read_mask(p, H, W, device)
-            cam_pose = get_tensor_from_camera(v.world_view_transform.transpose(0,1)).to(device)
-            masks.append(m); views.append(v); poses.append(cam_pose)
-        return views, masks, poses
-
-    if args.seg_dir and args.seg_views:
-        idxs = [int(x) for x in args.seg_views.split(",")]
-        seg_dir = Path(args.seg_dir)
-        for i in idxs:
-            v = views_all[i]
-            H, W = int(v.image_height), int(v.image_width)
-            # try image_name.png first, then 00000.png
-            cand1 = seg_dir / f"{v.image_name}.png"
-            cand2 = seg_dir / f"{i:05d}.png"
-            if cand1.exists():
-                mp = cand1
-            elif cand2.exists():
-                mp = cand2
-            else:
-                raise FileNotFoundError(f"No mask for view idx {i}: tried {cand1} and {cand2}")
-            m = _read_mask(mp, H, W, device)
-            cam_pose = get_tensor_from_camera(v.world_view_transform.transpose(0,1)).to(device)
-            masks.append(m); views.append(v); poses.append(cam_pose)
-        return views, masks, poses
-
-    raise ValueError("Provide either --seg_paths or (--seg_dir and --seg_views).")
+def include_pcs_in_hull(hull, all_xyz: torch.Tensor, margin: float = 0.0):
+    """
+    Select all points inside or on the convex hull.
+    all_xyz: (N,3) torch tensor
+    margin: outward grow in world units (default 0.0)
+    Returns: keep mask (N,) torch.bool
+    """
+    P = all_xyz.detach().cpu().numpy()
+    eq = hull.equations  # (F,4), each row: [nx, ny, nz, c]
+    A = eq[:, :3]
+    b = eq[:, 3]
+    if margin > 0:
+        n_norm = np.linalg.norm(A, axis=1, keepdims=True) + 1e-12
+        b = b - margin * n_norm.squeeze(1)
+    inside = np.all(P @ A.T + b <= 1e-9, axis=1)
+    return torch.from_numpy(inside).to(all_xyz.device)
 
 
 def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, masks, camera_poses, views):
     device = gaussians._xyz.device
-    # views, masks, camera_poses = _load_masks_and_views(scene, args, iteration, device)
 
     # 1) select by multi-view voting
     keep_idx = select_object_gaussians(
@@ -464,17 +483,23 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
         print("⚠️ No gaussians selected. Check masks & view indices.")
         return
 
-    # 2) compute bbox (AABB+OBB)
     xyz_obj = gaussians._xyz[keep_idx]
-    (aabb_min, aabb_max), (center, R, extents) = bbox_from_points(xyz_obj)
+    keep_final = keep_idx
 
-    # 3) optional crop by (A) AABB or (B) OBB + margin
-    if args.use_obb:
-        mask_box = inside_obb(gaussians._xyz, center, R, extents, margin=args.bbox_margin)
-    else:
-        mask_box = inside_aabb(gaussians._xyz, aabb_min, aabb_max, margin=args.bbox_margin)
+    ## Convex Hull
+    hull = get_hull(xyz_obj)
+    mask_sel = include_pcs_in_hull(hull, gaussians._xyz, margin=getattr(args, "hull_margin", 0.0))
 
-    keep_final = torch.nonzero(mask_box, as_tuple=True)[0]
+    ## Boundng Box
+    # (aabb_min, aabb_max), (center, R, extents) = bbox_from_points(xyz_obj)
+
+    # # 3) optional crop by (A) AABB or (B) OBB + margin
+    # if args.use_obb:
+    #     mask_sel = inside_obb(gaussians._xyz, center, R, extents, margin=args.bbox_margin)
+    # else:
+    #     mask_sel = inside_aabb(gaussians._xyz, aabb_min, aabb_max, margin=args.bbox_margin)
+
+    keep_final = torch.nonzero(mask_sel, as_tuple=True)[0]
     out_dir = Path(dataset.model_path) / f"objects/ours_{iteration}/{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -742,6 +767,7 @@ if __name__ == "__main__":
     parser.add_argument("--render_object", default=True, type=bool, help="Render the cropped splats with selected views.")
     parser.add_argument("--use_obb", action="store_true", help="Use OBB crop instead of AABB.")
     parser.add_argument("--bbox_margin", type=float, default=0.0, help="Expand bbox by this world distance.")
+    parser.add_argument("--hull_margin", type=float, default=0.0, help="Expand convex hull by this world distance.")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
