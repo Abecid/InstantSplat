@@ -308,7 +308,7 @@ def gaussians_inside_mask_dep(uv, vis, px_radius, mask_tensor, thresh=0.5):
     return keep
 
 
-def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
+def gaussians_inside_mask_ring(uv, vis, px_radius, mask_tensor, thresh=0.5):
     """
     mask_tensor: (H,W) float/bool/uint8; returns keep: (N,) bool
     Uses a tiny disk around each uv with radius ~ px_radius to be robust.
@@ -355,6 +355,58 @@ def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
     return keep
 
 
+def gaussians_inside_mask(uv, z, vis, px_radius, mask_tensor, thresh=0.5, keep_first_hit=False):
+    m = torch.as_tensor(mask_tensor, dtype=torch.float32, device=uv.device)
+    if m.ndim == 3:
+        m = m[...,0] if m.shape[-1] in (3,4) else m.squeeze(0)
+    H, W = m.shape
+
+    # center-only sample
+    grid_u = (uv[:,0] / max(W-1,1))*2 - 1
+    grid_v = (uv[:,1] / max(H-1,1))*2 - 1
+    grid = torch.stack([grid_u, grid_v], dim=1).view(1,1,-1,2)
+    s = F.grid_sample(m.view(1,1,H,W), grid, mode="bilinear", align_corners=True).view(-1)
+
+    keep = vis & (s > thresh)
+    
+    # Only keep first-hit gaussians at pixel centers
+    if keep_first_hit:
+        fh = first_hit_mask_center(uv, z, vis, H, W)
+        keep = keep & fh
+
+    print("mask_center:", {"inside": int((s>thresh).sum().item()), "vis": int(vis.sum().item()), "keep": int(keep.sum().item())})
+    return keep
+
+
+def first_hit_mask_center(uv, z, vis, H, W, tol=1e-6):
+    """
+    Keep gaussians that are the 'closest' at their rounded pixel center.
+    Uses |z| (since you've already enforced a consistent forward sign via `vis`).
+    """
+    if vis.dtype != torch.bool:
+        vis = vis.bool()
+
+    # Round to pixel centers (consistent with center-only sampling)
+    u_idx = uv[:, 0].round().clamp(0, W-1).long()
+    v_idx = uv[:, 1].round().clamp(0, H-1).long()
+    pix   = v_idx * W + u_idx
+
+    # Only consider visible gaussians
+    pix_vis = pix[vis]
+    z_eff   = z.abs()
+    z_vis   = z_eff[vis]
+
+    # Compute per-pixel min depth via scatter_reduce
+    big = torch.full((H*W,), float('inf'), device=z.device, dtype=z_vis.dtype)
+    depth_min = big.scatter_reduce(0, pix_vis, z_vis, reduce='amin', include_self=True)
+
+    # Mark those that match the min for their pixel (within tol)
+    is_min_vis = z_vis <= (depth_min[pix_vis] + tol)
+
+    keep = torch.zeros_like(vis)
+    keep[vis] = is_min_vis
+    return keep
+
 
 def select_object_gaussians(pc, views, masks, camera_poses, vote_thresh=None):
     """
@@ -369,7 +421,7 @@ def select_object_gaussians(pc, views, masks, camera_poses, vote_thresh=None):
 
     for view, mask, cam_pose in zip(views, masks, camera_poses):
         uv, z, vis, r = project_gaussians_to_pixels(pc, view, cam_pose)
-        keep = gaussians_inside_mask(uv, vis, r, mask[0])
+        keep = gaussians_inside_mask(uv, z, vis, r, mask[0])
         votes += keep.int()
 
     if vote_thresh is None or vote_thresh < 0:
@@ -487,8 +539,8 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     keep_final = keep_idx
 
     ## Convex Hull
-    hull = get_hull(xyz_obj)
-    mask_sel = include_pcs_in_hull(hull, gaussians._xyz, margin=getattr(args, "hull_margin", 0.0))
+    # hull = get_hull(xyz_obj)
+    # mask_sel = include_pcs_in_hull(hull, gaussians._xyz, margin=getattr(args, "hull_margin", 0.0))
 
     ## Boundng Box
     # (aabb_min, aabb_max), (center, R, extents) = bbox_from_points(xyz_obj)
@@ -499,7 +551,7 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     # else:
     #     mask_sel = inside_aabb(gaussians._xyz, aabb_min, aabb_max, margin=args.bbox_margin)
 
-    keep_final = torch.nonzero(mask_sel, as_tuple=True)[0]
+    # keep_final = torch.nonzero(mask_sel, as_tuple=True)[0]
     out_dir = Path(dataset.model_path) / f"objects/ours_{iteration}/{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
