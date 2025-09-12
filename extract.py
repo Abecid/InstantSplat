@@ -90,9 +90,13 @@ def images_to_video(image_folder, output_video_path, fps=30):
 
     imageio.mimwrite(output_video_path, images, fps=fps)
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, num_sample_renderings=None):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, num_sample_renderings=None, view=None):
+    if view is None:
+        render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
+        gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    else:
+        render_path = os.path.join(model_path, name, "ours_{}".format(iteration), str(view), "renders")
+        gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), str(view), "gt")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
@@ -355,7 +359,23 @@ def gaussians_inside_mask_ring(uv, vis, px_radius, mask_tensor, thresh=0.5):
     return keep
 
 
-def gaussians_inside_mask(uv, z, vis, px_radius, mask_tensor, thresh=0.5, keep_first_hit=False):
+def gaussians_inside_mask_simple(uv, z, vis, px_radius, mask_tensor, thresh=0.5):
+    # assumes: vis already guarantees in-bounds & correct facing
+    m = torch.as_tensor(mask_tensor, device=uv.device, dtype=torch.float32)
+    
+    if m.ndim == 3:                     # (H,W,3/4) -> (H,W)
+        m = m[..., 0]
+
+    i = uv[:, 1].round().long()         # row (y)
+    j = uv[:, 0].round().long()         # col (x)
+
+    keep = torch.zeros(uv.size(0), dtype=torch.bool, device=uv.device)
+    v = vis.nonzero(as_tuple=True)[0]   # only index masked-in points
+    if v.numel():
+        keep[v] = m[i[v], j[v]] > thresh
+    return keep
+
+def gaussians_inside_mask(uv, z, vis, px_radius, mask_tensor, thresh=0.9, keep_first_hit=False):
     m = torch.as_tensor(mask_tensor, dtype=torch.float32, device=uv.device)
     if m.ndim == 3:
         m = m[...,0] if m.shape[-1] in (3,4) else m.squeeze(0)
@@ -419,15 +439,22 @@ def select_object_gaussians(pc, views, masks, camera_poses, vote_thresh=None):
     N = pc._xyz.shape[0]
     votes = torch.zeros(N, device=device, dtype=torch.int32)
 
+    gaussians_per_view = {}
+
+    idx = 0
     for view, mask, cam_pose in zip(views, masks, camera_poses):
         uv, z, vis, r = project_gaussians_to_pixels(pc, view, cam_pose)
-        keep = gaussians_inside_mask(uv, z, vis, r, mask[0])
+        keep = gaussians_inside_mask_simple(uv, z, vis, r, mask[0])
+        # keep = vis
         votes += keep.int()
+        gaussians_per_view[idx] = keep.nonzero(as_tuple=True)[0]
+
+        idx += 1
 
     if vote_thresh is None or vote_thresh < 0:
         vote_thresh = (K+1)//2
     keep_idx = (votes >= vote_thresh).nonzero(as_tuple=True)[0]
-    return keep_idx
+    return keep_idx, gaussians_per_view
 
 
 def bbox_from_points(xyz):
@@ -526,10 +553,14 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     device = gaussians._xyz.device
 
     # 1) select by multi-view voting
-    keep_idx = select_object_gaussians(
+    keep_idx, gaussians_per_view = select_object_gaussians(
         gaussians, views, masks, camera_poses,
         vote_thresh=args.vote_thresh
     )
+
+    for view, idx in gaussians_per_view.items():
+        obj_pc = build_submodel(gaussians, idx, sh_degree=dataset.sh_degree)
+        render_set(dataset.model_path, f"{args.out_tag}_renders/", iteration, views, obj_pc, pipeline, background, view=view)
 
     if keep_idx.numel() == 0:
         print("⚠️ No gaussians selected. Check masks & view indices.")
