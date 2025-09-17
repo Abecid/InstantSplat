@@ -114,6 +114,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             get_uv=get_uv
         )
         rendering = render_dict["render"]
+        
         gt = view.original_image[0:3, :, :]
         image_path = os.path.join(render_path, "{0:05d}".format(idx) + ".png")
         torchvision.utils.save_image(
@@ -129,6 +130,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
             render_dict["view"] = view
             render_dicts.append(render_dict)
+
+            rerenddering = render_dict.get("rerender", None)
+            rerender_image_path = image_path.replace("renders", "rerenders")
+            if rerenddering is not None:
+                makedirs(os.path.dirname(rerender_image_path), exist_ok=True)
+                torchvision.utils.save_image(
+                    rerenddering, rerender_image_path
+                )
             # sample_renderings.append(rendering.detach().cpu().numpy())
 
     if num_sample_renderings:

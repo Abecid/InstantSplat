@@ -20,6 +20,51 @@ from utils.sh_utils import eval_sh
 from utils.pose_utils import get_camera_from_tensor, quadmultiply
 
 
+def rerender_uv(render_dict, rasterizer, raster_settings, means3D, cov3D_precomp, shs, colors_precomp,
+    opacity, scales, rotations):
+    keep = render_dict["vis"]
+    idx  = keep.nonzero(as_tuple=False).squeeze(1)
+
+    if idx.numel() == 0:
+        subimg  = torch.ones_like(render_dict["render"]) * raster_settings.bg.view(1, -1, 1, 1)
+        subrads = torch.zeros_like(render_dict["radii"])
+        return None
+    else:
+        # Subselect EVERYTHING you passed originally
+        f_means3D = means3D[idx].contiguous()
+        f_means2D = (torch.zeros_like(f_means3D)
+                        .requires_grad_(True))  # placeholder for screen-space grads
+        try: f_means2D.retain_grad()
+        except: pass
+
+        f_opacity = opacity[idx]
+
+        if cov3D_precomp is not None:
+            f_cov3D     = cov3D_precomp[idx]
+            f_scales    = None
+            f_rotations = None
+        else:
+            f_cov3D     = None
+            f_scales    = scales[idx]
+            f_rotations = rotations[idx]           # <- your gaussians_rot_trans subset
+
+        if shs is not None and shs.numel() > 0:
+            f_shs          = shs[idx]
+            f_colors_prec  = None
+        else:
+            f_shs          = None
+            f_colors_prec  = colors_precomp[idx] if colors_precomp is not None else None
+
+        # Re-render with the SAME rasterizer (same raster_settings)
+        subimg, subrads = rasterizer(
+            means3D=f_means3D, means2D=f_means2D,
+            shs=f_shs, colors_precomp=f_colors_prec,
+            opacities=f_opacity, scales=f_scales, rotations=f_rotations,
+            cov3D_precomp=f_cov3D
+        )
+        return subimg
+
+
 def render(
     viewpoint_camera,
     pc: GaussianModel,
@@ -151,22 +196,39 @@ def render(
         x = means3D[:, 0]
         y = means3D[:, 1]
         z = means3D[:, 2]
-        z_safe = torch.where(z.abs() < 1e-8, z.sign() * 1e-8, z)
 
-        # kernel-equivalent projection using tan(fov/2) and -Z forward
-        u = ((x / (-z_safe * tanfovx)) * 0.5 + 0.5) * W
-        v = (1.0 - ((y / (-z_safe * tanfovy)) * 0.5 + 0.5)) * H
-        uv = torch.stack([u, v], dim=1)
+        # z_safe = torch.where(z.abs() < 1e-8, z.sign() * 1e-8, z)
 
-        # gate to image bounds and consistent front-side
-        in_img = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-        vis_final = (radii > 0) & in_img
+        # u = ((x / (-z_safe * tanfovx)) * 0.5 + 0.5) * W - 0.5
+        # v = (1.0 - ((y / (-z_safe * tanfovy)) * 0.5 + 0.5)) * H - 0.5
 
-        render_dict["uv"] = uv
+        eps = 1e-8
+        z_safe = torch.where(z.abs() < eps, torch.where(z >= 0, torch.full_like(z, eps),
+            torch.full_like(z, -eps)), z)
+
+        ndc_x = x / (-z_safe * tanfovx)
+        ndc_y = y / (-z_safe * tanfovy)
+
+        u = (ndc_x * 0.5 + 0.5) * W - 0.5
+        v = (1.0 - (ndc_y * 0.5 + 0.5)) * H - 0.5
+
+        # in-bounds with half-pixel centers
+        in_img = (u >= 0.0) & (u <= (W - 1)) & (v >= 0.0) & (v <= (H - 1))
+
+        # trust the rasterizer for vis, just gate by in-bounds
+        vis_ras   = (radii > 0)
+        vis_final = vis_ras & in_img
+
+        render_dict["uv"]  = torch.stack([u, v], dim=1)
         render_dict["vis"] = vis_final
 
-        print(f"In image: {in_img.sum().item()} / {pc.get_xyz.shape[0]}")
-        print(f"Visible Gaussians: {vis_final.sum().item()} / {pc.get_xyz.shape[0]}")
+        print(f"In image: {int(in_img.sum())}/{pc.get_xyz.shape[0]}, "
+            f"ras_vis={int(vis_ras.sum())}, vis_final={int(vis_final.sum())}")
+
+        rerendered_image = rerender_uv(render_dict, rasterizer, raster_settings, means3D, 
+            cov3D_precomp, shs, colors_precomp, opacity, scales, rotations) if vis_final.any() else None
+        if rerendered_image is not None:
+            render_dict["rerender"] = rerendered_image
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
