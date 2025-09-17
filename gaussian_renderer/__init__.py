@@ -28,6 +28,7 @@ def render(
     scaling_modifier=1.0,
     override_color=None,
     camera_pose=None,
+    get_uv=False,
 ):
     """
     Render the scene.
@@ -136,11 +137,37 @@ def render(
         cov3D_precomp=cov3D_precomp,
     )
 
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
-    return {
+    render_dict = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,
-        "visibility_filter": radii > 0,
         "radii": radii,
+        "visibility_filter": radii > 0,
     }
+
+    if get_uv:
+        H = int(viewpoint_camera.image_height)
+        W = int(viewpoint_camera.image_width)
+
+        x = means3D[:, 0]
+        y = means3D[:, 1]
+        z = means3D[:, 2]
+        z_safe = torch.where(z.abs() < 1e-8, z.sign() * 1e-8, z)
+
+        # kernel-equivalent projection using tan(fov/2) and -Z forward
+        u = ((x / (-z_safe * tanfovx)) * 0.5 + 0.5) * W
+        v = (1.0 - ((y / (-z_safe * tanfovy)) * 0.5 + 0.5)) * H
+        uv = torch.stack([u, v], dim=1)
+
+        # gate to image bounds and consistent front-side
+        in_img = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        vis_final = (radii > 0) & in_img
+
+        render_dict["uv"] = uv
+        render_dict["vis"] = vis_final
+
+        print(f"In image: {in_img.sum().item()} / {pc.get_xyz.shape[0]}")
+        print(f"Visible Gaussians: {vis_final.sum().item()} / {pc.get_xyz.shape[0]}")
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return render_dict

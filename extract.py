@@ -103,13 +103,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     if num_sample_renderings:
         sample_renderings = []
+        render_dicts = []
         indices = np.linspace(0, len(views)-1, num_sample_renderings, dtype=int)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         camera_pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1))
-        rendering = render(
-            view.float(), gaussians, pipeline, background, camera_pose=camera_pose.float()
-        )["render"]
+        get_uv = num_sample_renderings and idx in indices
+        render_dict = render(
+            view.float(), gaussians, pipeline, background, camera_pose=camera_pose.float(),
+            get_uv=get_uv
+        )
+        rendering = render_dict["render"]
         gt = view.original_image[0:3, :, :]
         image_path = os.path.join(render_path, "{0:05d}".format(idx) + ".png")
         torchvision.utils.save_image(
@@ -122,10 +126,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         if num_sample_renderings and idx in indices:
             image = np.array(cv2.imread(image_path))
             sample_renderings.append(image)
+
+            render_dict["view"] = view
+            render_dicts.append(render_dict)
             # sample_renderings.append(rendering.detach().cpu().numpy())
 
     if num_sample_renderings:
-        return sample_renderings
+        return sample_renderings, render_dicts
 
 def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -217,7 +224,56 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
             fp.write('\n')
 
 
-def project_gaussians_to_pixels(pc, view, camera_pose):
+def project_gaussians_to_pixels(pc, view):
+    device = pc._xyz.device
+    dtype  = torch.float32  # keep things consistent
+    H, W = int(view.image_height), int(view.image_width)
+
+    camera_pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1)).float()
+
+    rel_w2c = get_camera_from_tensor(camera_pose).to(device=device, dtype=dtype)
+    N = pc._xyz.shape[0]
+    xyz_h = torch.cat([pc._xyz.to(dtype), torch.ones(N,1,device=device,dtype=dtype)], dim=1)
+    cam = (rel_w2c @ xyz_h.T).T
+
+    x, y, z = cam[:,0], cam[:,1], cam[:,2]
+    z_safe = torch.where(z == 0, torch.full_like(z, 1e-8), z)
+
+    FoVx = torch.as_tensor(getattr(view, "FoVx"), device=device, dtype=dtype)
+    FoVy = torch.as_tensor(getattr(view, "FoVy"), device=device, dtype=dtype)
+    if float(FoVx) > 3.2 or float(FoVy) > 3.2:
+        FoVx = torch.deg2rad(FoVx); FoVy = torch.deg2rad(FoVy)
+
+    fx = 0.5 * W / torch.tan(FoVx / 2)
+    fy = 0.5 * H / torch.tan(FoVy / 2)
+    cx = 0.5 * W
+    cy = 0.5 * H
+    
+    zf = (-z_safe)  # NOTE: minus sign
+    u = fx * (x / z_safe) + cx
+    v = cy - fy * (y / z_safe)
+    uv = torch.stack([u, v], dim=1)
+
+    in_img = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    vis_neg = (z < 0) & in_img
+    vis_pos = (z > 0) & in_img
+    vis = vis_neg if vis_neg.sum() >= vis_pos.sum() else vis_pos
+
+    s = pc.get_scaling.to(device=device, dtype=dtype).max(dim=1).values
+    f_mean = 0.5 * (fx + fy)
+    px_radius = (f_mean * s / z.abs().clamp(min=1e-6)).clamp(max=64.0)
+
+    print("proj:", {
+        "in_img": int(in_img.sum().item()),
+        "z<0": int((z<0).sum().item()),
+        "z>0": int((z>0).sum().item()),
+        "vis": int(vis.sum().item())}
+    )
+    return uv, z, vis, px_radius
+
+
+
+def project_gaussians_to_pixels_dep(pc, view, camera_pose):
     """
     Returns:
       uv: (N, 2) pixel coords
@@ -282,7 +338,7 @@ def project_gaussians_to_pixels(pc, view, camera_pose):
 
 
 
-def gaussians_inside_mask_dep(uv, vis, px_radius, mask_tensor, thresh=0.5):
+def gaussians_inside_mask(uv, vis, px_radius, mask_tensor, thresh=0.5):
     """
     mask_tensor: (H,W) float/bool on same device
     Returns keep: (N,) bool
@@ -428,24 +484,48 @@ def first_hit_mask_center(uv, z, vis, H, W, tol=1e-6):
     return keep
 
 
-def select_object_gaussians(pc, views, masks, camera_poses, vote_thresh=None):
+def gaussians_inside_mask_uv(uv, vis, m, size):
+    H, W = size
+
+    if isinstance(m, np.ndarray):
+        m = torch.from_numpy(m)          # convert to torch
+    m = (m > 0.5).to(torch.bool).to(uv.device)
+
+    assert m.shape[-2:] == (H, W), f"Mask {m.shape[-2:]} != {(H,W)}"
+
+    u = uv[:,0].round().clamp(0, W-1).long()
+    v = uv[:,1].round().clamp(0, H-1).long()
+    in_mask = m[v, u]
+
+    keep = vis & in_mask
+    return keep
+
+
+def select_object_gaussians(pc, render_dicts, masks, vote_thresh=None):
     """
     views: list of view objects (same as your render loop)
     masks: list of (H,W) tensors (0/1) on CUDA
     camera_poses: list of (q,T) tensors (same format you pass render)
     """
     device = pc._xyz.device
-    K = len(views)
+
+    K = len(render_dicts)
     N = pc._xyz.shape[0]
     votes = torch.zeros(N, device=device, dtype=torch.int32)
 
     gaussians_per_view = {}
 
     idx = 0
-    for view, mask, cam_pose in zip(views, masks, camera_poses):
-        uv, z, vis, r = project_gaussians_to_pixels(pc, view, cam_pose)
-        keep = gaussians_inside_mask_simple(uv, z, vis, r, mask[0])
+    for out, mask in zip(render_dicts, masks):
         # keep = vis
+
+        # uv, z, vis, r = project_gaussians_to_pixels(pc, view)
+        # keep = gaussians_inside_mask_simple(uv, z, vis, r, mask[0])
+
+        view = out["view"]
+        size = (int(view.image_height), int(view.image_width))
+        keep = gaussians_inside_mask_uv(out["uv"], out["vis"], mask[0], size)
+        
         votes += keep.int()
         gaussians_per_view[idx] = keep.nonzero(as_tuple=True)[0]
 
@@ -549,12 +629,14 @@ def include_pcs_in_hull(hull, all_xyz: torch.Tensor, margin: float = 0.0):
     return torch.from_numpy(inside).to(all_xyz.device)
 
 
-def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, masks, camera_poses, views):
+def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, masks, render_dicts):
     device = gaussians._xyz.device
+
+    views = [r["view"] for r in render_dicts]
 
     # 1) select by multi-view voting
     keep_idx, gaussians_per_view = select_object_gaussians(
-        gaussians, views, masks, camera_poses,
+        gaussians, render_dicts, masks,
         vote_thresh=args.vote_thresh
     )
 
@@ -646,7 +728,7 @@ def render_sets(
         save_interpolate_pose(Path(args.model_path), iteration, args.n_views)
         interp_pose = np.load(Path(args.model_path) / 'pose' / f'ours_{iteration}' / 'pose_interpolated.npy')
         viewpoint_stack = loadCameras(interp_pose, scene.getTrainCameras())
-        renderings = render_set(
+        renderings, render_dicts = render_set(
             dataset.model_path,
             "interp",
             scene.loaded_iter,
@@ -723,6 +805,13 @@ def render_sets(
         main_cam_view=config.main_cam,
         cam_coords=roi_mask_coords,
     )
+    
+    poses = []
+    segments = []
+    views = []
+    views_all = viewpoint_stack
+    device = gaussians._xyz.device
+
     for i, cam_view in enumerate(valid_camera_views):
         vco_cam_view = valid_vco_camera_views[i]
         output_data = segmentationmap(
@@ -747,25 +836,27 @@ def render_sets(
         cv2.imwrite(output_image_path, overlay)
         print(f"Saved image with segmentation map: {output_image_path}")
 
-    poses = []
-    segments = []
-    views = []
-    views_all = viewpoint_stack
-    device = gaussians._xyz.device
-    for i, cam_view in enumerate(valid_camera_views):
-        vco_cam_view = valid_vco_camera_views[i]
         v = views_all[cam_view]
         cam_pose = get_tensor_from_camera(v.world_view_transform.transpose(0,1)).to(device)
         poses.append(cam_pose)
         segments.append(output_data.multisegmentlist[vco_cam_view][0])
         views.append(v)
 
+    
+    # for i, cam_view in enumerate(valid_camera_views):
+    #     vco_cam_view = valid_vco_camera_views[i]
+    #     v = views_all[cam_view]
+    #     cam_pose = get_tensor_from_camera(v.world_view_transform.transpose(0,1)).to(device)
+    #     poses.append(cam_pose)
+    #     segments.append(output_data.multisegmentlist[vco_cam_view][0])
+    #     views.append(v)
+
     # Get 3D Bounding Boxes
     # Get object gasusian splatting
     
     # Save GSplat
     # Save rendering
-    get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, segments, poses, views)
+    get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, segments, render_dicts)
 
 
 dataset_type="welstory_1st"
