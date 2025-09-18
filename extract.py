@@ -661,6 +661,8 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     xyz_obj = gaussians._xyz[keep_idx]
     keep_final = keep_idx
 
+    print(f"Selected {keep_idx.shape[0]} gaussians after voting.")
+
     ## Convex Hull
     hull = get_hull(xyz_obj)
     mask_sel = include_pcs_in_hull(hull, gaussians._xyz, margin=getattr(args, "hull_margin", 0.0))
@@ -675,6 +677,7 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     #     mask_sel = inside_aabb(gaussians._xyz, aabb_min, aabb_max, margin=args.bbox_margin)
 
     keep_final = torch.nonzero(mask_sel, as_tuple=True)[0]
+    print(f"Kept {keep_final.shape[0]} gaussians after hull cropping.")
     out_dir = Path(dataset.model_path) / f"objects/ours_{iteration}/{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -775,6 +778,10 @@ def render_sets(
     render_path = os.path.join(dataset.model_path, "interp", "ours_{}".format(1000), "renders")
     intermediate_output_path = os.path.join(dataset.model_path, "interp", "ours_{}".format(1000), "intermediate_output")
     os.makedirs(intermediate_output_path, exist_ok=True)
+
+    clean_segments_output_path = os.path.join(intermediate_output_path, "clean_segments")
+    os.makedirs(clean_segments_output_path, exist_ok=True)
+
     for i, cam_view in enumerate(valid_camera_views):
         occupancy_check = False
         if renderings[i] is None:
@@ -845,6 +852,16 @@ def render_sets(
         output_image_path = os.path.join(intermediate_output_path, "{0:05d}_segmentation.png".format(cam_view))
         cv2.imwrite(output_image_path, overlay)
         print(f"Saved image with segmentation map: {output_image_path}")
+
+        # Save rgba segmentation image
+        output_image = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+        background_mask = segmentmap == 0
+        output_image[background_mask, 3] = 0 # Index 3 is the alpha channel
+
+        # 5. Save the final image with a transparent background
+        # The file MUST be saved as a .png to preserve transparency
+        output_image_path = os.path.join(clean_segments_output_path, "{0:05d}.png".format(cam_view))
+        cv2.imwrite(output_image_path, output_image)
 
         v = views_all[cam_view]
         cam_pose = get_tensor_from_camera(v.world_view_transform.transpose(0,1)).to(device)
