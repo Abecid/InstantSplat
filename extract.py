@@ -662,8 +662,8 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     keep_final = keep_idx
 
     ## Convex Hull
-    # hull = get_hull(xyz_obj)
-    # mask_sel = include_pcs_in_hull(hull, gaussians._xyz, margin=getattr(args, "hull_margin", 0.0))
+    hull = get_hull(xyz_obj)
+    mask_sel = include_pcs_in_hull(hull, gaussians._xyz, margin=getattr(args, "hull_margin", 0.0))
 
     ## Boundng Box
     # (aabb_min, aabb_max), (center, R, extents) = bbox_from_points(xyz_obj)
@@ -674,7 +674,7 @@ def get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline
     # else:
     #     mask_sel = inside_aabb(gaussians._xyz, aabb_min, aabb_max, margin=args.bbox_margin)
 
-    # keep_final = torch.nonzero(mask_sel, as_tuple=True)[0]
+    keep_final = torch.nonzero(mask_sel, as_tuple=True)[0]
     out_dir = Path(dataset.model_path) / f"objects/ours_{iteration}/{args.out_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
