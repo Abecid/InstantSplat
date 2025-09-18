@@ -129,6 +129,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             sample_renderings.append(image)
 
             render_dict["view"] = view
+            render_dict["idx"] = idx
             render_dicts.append(render_dict)
 
             rerenddering = render_dict.get("rerender", None)
@@ -852,19 +853,6 @@ def render_sets(
         views.append(v)
 
     
-    # for i, cam_view in enumerate(valid_camera_views):
-    #     vco_cam_view = valid_vco_camera_views[i]
-    #     v = views_all[cam_view]
-    #     cam_pose = get_tensor_from_camera(v.world_view_transform.transpose(0,1)).to(device)
-    #     poses.append(cam_pose)
-    #     segments.append(output_data.multisegmentlist[vco_cam_view][0])
-    #     views.append(v)
-
-    # Get 3D Bounding Boxes
-    # Get object gasusian splatting
-    
-    # Save GSplat
-    # Save rendering
     get_object_gaussians_and_save(gaussians, scene, dataset, iteration, pipeline, background, args, segments, render_dicts)
 
 

@@ -197,16 +197,11 @@ def render(
         y = means3D[:, 1]
         z = means3D[:, 2]
 
-        # z_safe = torch.where(z.abs() < 1e-8, z.sign() * 1e-8, z)
-
-        # u = ((x / (-z_safe * tanfovx)) * 0.5 + 0.5) * W - 0.5
-        # v = (1.0 - ((y / (-z_safe * tanfovy)) * 0.5 + 0.5)) * H - 0.5
-
         eps = 1e-8
         z_safe = torch.where(z.abs() < eps, torch.where(z >= 0, torch.full_like(z, eps),
             torch.full_like(z, -eps)), z)
 
-        ndc_x = x / (-z_safe * tanfovx)
+        ndc_x = -x / (-z_safe * tanfovx)
         ndc_y = y / (-z_safe * tanfovy)
 
         u = (ndc_x * 0.5 + 0.5) * W - 0.5
