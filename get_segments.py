@@ -27,13 +27,21 @@ from modules.objectDetect import ObjectDetector
 from interface.common import CameraView
 from modules.outputData import OutputData
 
-imgs_path = "assets/welstory/362/images"
-output_path = "output/welstory/362/segmentations"
-bbox_output_path = "output/welstory/362/bboxes"
-overlay_segments_output_path = "output/welstory/362/overlay_segments"
-rmbeg_output_path = "output/welstory/362/rembg"
+# Image paths
+dataset_name = "welstory_eval"
+data_id = "9"
+
+imgs_path = f"assets/welstory/362/images"
+imgs_path = f"assets/{dataset_name}/{data_id}/images"
+
+# Output paths
+output_path = f"output/{dataset_name}/{data_id}/segmentations"
+bbox_output_path = f"output/{dataset_name}/{data_id}/bboxes"
+overlay_segments_output_path = f"output/{dataset_name}/{data_id}/overlay_segments"
+rmbeg_output_path = f"output/{dataset_name}/{data_id}/rembg"
 
 dataset_type="welstory_1st"
+# dataset_type = "custom"
 
 mannamil_dataset_path = "dataset/0000_mannamil_20250707_061547/raw"
 vco_2nd_dataset_path = "dataset/vco_2nd_eval/data/vco_7/log/capture"
@@ -49,6 +57,8 @@ elif dataset_type == "vco_2nd":
 elif dataset_type == "welstory_1st":
     data_id = "9"
     dataset_path = f"{welstory_poc_dataset_path}/{data_id}"
+elif dataset_type == "custom":
+    dataset_path = "assets/welstory_eval/9/0_TC_L.jpg"
 
 def vco_setup():
     vco_args = make_vco_args(overrides={
@@ -135,7 +145,7 @@ def main():
     for i, img_name in enumerate(images):
         occupancy_check = False
         image = images[img_name]
-        vco_cam_view = img_name.split("_")[2]
+        vco_cam_view = img_name.split("_")[-2]
 
         (
             output_data.objectbox[vco_cam_view],
@@ -173,7 +183,7 @@ def main():
 
     for i, img_name in enumerate(images):
         image = images[img_name]
-        vco_cam_view = img_name.split("_")[2]
+        vco_cam_view = img_name.split("_")[-2]
 
         output_data = segmentationmap(
             image,
@@ -185,7 +195,11 @@ def main():
             use_detection_segmentation=config.use_detection_segmentation,
         )
 
-        segmentmap = output_data.multisegmentlist[vco_cam_view][0][0]
+        try:
+            segmentmap = output_data.multisegmentlist[vco_cam_view][0][0]
+        except Exception as e:
+            print(f"Segmentation failed for {img_name}, using empty mask. Error: {e}")
+            continue
         # Draw segmentation map on the image
         colored_mask = (segmentmap * 255).astype(np.uint8)
         colored_mask = cv2.applyColorMap(colored_mask, cv2.COLORMAP_JET)

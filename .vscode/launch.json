@@ -1,3 +1,30 @@
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Run render.py with conda env",
+//             "type": "debugpy",
+//             "request": "launch",
+//             "python": "/home/fai/anaconda3/envs/instantsplat/bin/python",
+//             "program": "${workspaceFolder}/extract.py",
+//             "console": "integratedTerminal",
+//             "env": {
+//                 "CUDA_VISIBLE_DEVICES": "0"
+//             },
+//             "args": [
+//                 "-s", "assets/welstory/362",
+//                 "-m", "output_infer/welstory/362/3_views",
+//                 "-r", "1",
+//                 "--n_views", "3",
+//                 "--iterations", "1000",
+//                 "--vote_thresh", "2",
+//                 "--infer_video"
+//             ]
+//         }
+//     ]
+// }
+
+
 {
     "version": "0.2.0",
     "configurations": [
@@ -6,19 +33,13 @@
             "type": "debugpy",
             "request": "launch",
             "python": "/home/fai/anaconda3/envs/instantsplat/bin/python",
-            "program": "${workspaceFolder}/extract.py",
+            "program": "${workspaceFolder}/get_segments.py",
             "console": "integratedTerminal",
             "env": {
                 "CUDA_VISIBLE_DEVICES": "0"
             },
             "args": [
-                "-s", "assets/welstory/362",
-                "-m", "output_infer/welstory/362/3_views",
-                "-r", "1",
-                "--n_views", "3",
-                "--iterations", "1000",
-                "--vote_thresh", "2",
-                "--infer_video"
+                
             ]
         }
     ]

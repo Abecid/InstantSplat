@@ -152,7 +152,7 @@ if __name__ == "__main__":
     ap.add_argument("--pc_path", type=str, help="Point cloud (npy) path")
     ap.add_argument("--out", default="output")
     ap.add_argument("--depth", type=int, default=10)
-    ap.add_argument("--trim_q", type=float, default=0.55)  # 0.50–0.65 usually good
+    ap.add_argument("--trim_q", type=float, default=0.2)  # 0.50–0.65 usually good
     args = ap.parse_args()
 
     input_name = "mesh"
